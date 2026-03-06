@@ -256,10 +256,20 @@ export const useGameStore = create<GameStore>((set, get) => ({
         }
       }
 
+      // Pre-mark players that are ABOUT to animate as animating — synchronously,
+      // before the setTimeout(0) fires animatePlayerMove. This prevents the
+      // `propertyLanded` event (which can arrive on the next tick) from seeing
+      // an empty animatingPlayerIds and flashing the modal too early.
+      const pendingAnimatorIds =
+        toAnimate.length > 0
+          ? [...new Set([...animatingPlayerIds, ...toAnimate.map((a) => a.id)])]
+          : animatingPlayerIds;
+
       set({
         gameState: state,
         playerDisplayPositions: newDisplayPositions,
         currentGameId: state.gameId,
+        animatingPlayerIds: pendingAnimatorIds,
         // Only activate turn timer display when no animation is in progress
         activeTurnTimerEndsAt:
           toAnimate.length === 0 && animatingPlayerIds.length === 0

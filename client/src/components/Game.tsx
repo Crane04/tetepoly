@@ -6,6 +6,86 @@ import Board, { PLAYER_COLORS } from "./Board";
 import PropertyCard from "./PropertyCard";
 import CardDrawnModal from "./CardDrawnModal";
 
+// ── 3D Dice ──────────────────────────────────────────────────────────────────
+const DOT_POS: Record<number, [number, number][]> = {
+  1: [[50, 50]],
+  2: [[28, 28], [72, 72]],
+  3: [[28, 28], [50, 50], [72, 72]],
+  4: [[28, 28], [72, 28], [28, 72], [72, 72]],
+  5: [[28, 28], [72, 28], [50, 50], [28, 72], [72, 72]],
+  6: [[28, 25], [72, 25], [28, 50], [72, 50], [28, 75], [72, 75]],
+};
+
+// Rotation to bring each face's number to face the camera.
+// Face layout: front=1, back=6, right=3, left=4, top=5, bottom=2
+const CUBE_ROT: Record<number, string> = {
+  1: "rotateX(0deg) rotateY(0deg)",
+  2: "rotateX(-90deg) rotateY(0deg)",
+  3: "rotateY(-90deg) rotateX(0deg)",
+  4: "rotateY(90deg) rotateX(0deg)",
+  5: "rotateX(90deg) rotateY(0deg)",
+  6: "rotateY(180deg) rotateX(0deg)",
+};
+
+const DIE_FACES: { num: number; tf: string }[] = [
+  { num: 1, tf: "translateZ(22px)" },
+  { num: 6, tf: "rotateY(180deg) translateZ(22px)" },
+  { num: 3, tf: "rotateY(90deg) translateZ(22px)" },
+  { num: 4, tf: "rotateY(-90deg) translateZ(22px)" },
+  { num: 5, tf: "rotateX(-90deg) translateZ(22px)" },
+  { num: 2, tf: "rotateX(90deg) translateZ(22px)" },
+];
+
+function Dice3D({ value }: { value: number }) {
+  return (
+    <div style={{ width: 44, height: 44, perspective: 220 }}>
+      <div
+        style={{
+          width: 44,
+          height: 44,
+          position: "relative",
+          transformStyle: "preserve-3d",
+          transform: CUBE_ROT[value] ?? "rotateX(0deg) rotateY(0deg)",
+          transition: "transform 0.45s cubic-bezier(0.25,0.46,0.45,0.94)",
+        }}
+      >
+        {DIE_FACES.map(({ num, tf }) => (
+          <div
+            key={num}
+            style={{
+              position: "absolute",
+              inset: 0,
+              backgroundColor: "#0d1019",
+              border: "1.5px solid #222a38",
+              borderRadius: 7,
+              backfaceVisibility: "hidden",
+              WebkitBackfaceVisibility: "hidden",
+              transform: tf,
+            }}
+          >
+            {(DOT_POS[num] ?? []).map(([x, y], i) => (
+              <div
+                key={i}
+                style={{
+                  position: "absolute",
+                  width: 7,
+                  height: 7,
+                  borderRadius: "50%",
+                  backgroundColor: "#8ab0a8",
+                  left: `${x}%`,
+                  top: `${y}%`,
+                  transform: "translate(-50%, -50%)",
+                  boxShadow: "0 0 4px #3a7060aa",
+                }}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // Sidebar asset accent colors (visible on dark bg)
 const ASSET_ACCENT: Record<string, string> = {
   Brown: "#7a3510",
@@ -186,23 +266,6 @@ export default function Game() {
             <span className="font-mono text-sm font-semibold text-slate-300">
               ${me.money.toLocaleString()}
             </span>
-          )}
-          {/* Dice result (compact) */}
-          {gameState.diceRoll && (
-            <div className="flex items-center gap-1 font-mono text-xs text-[#2a3848]">
-              <span className="bg-[#0f1117] border border-[#1a1f2c] px-1.5 py-0.5 rounded text-slate-400">
-                {gameState.diceRoll[0]}
-              </span>
-              <span>+</span>
-              <span className="bg-[#0f1117] border border-[#1a1f2c] px-1.5 py-0.5 rounded text-slate-400">
-                {gameState.diceRoll[1]}
-              </span>
-              {gameState.lastDiceRollWasDoubles && (
-                <span className="text-[#2a5040] tracking-widest uppercase text-[10px] ml-1">
-                  ×2
-                </span>
-              )}
-            </div>
           )}
         </div>
 
@@ -405,58 +468,36 @@ export default function Game() {
               onSpaceClick={(space) => setViewingSpace(space)}
             />
 
-            {/* Roll dice overlay */}
-            {canRollDice && (
+            {/* Center overlay: 3D dice result + roll button */}
+            {(canRollDice || gameState.diceRoll) && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <button
-                  className="bg-[#0c0e15]/90 hover:bg-[#111520] border border-[#1e2230] hover:border-[#2a3848] rounded-xl px-8 py-5 text-[10px] font-semibold tracking-[0.25em] uppercase text-[#3a5060] hover:text-slate-400 transition-all pointer-events-auto shadow-2xl backdrop-blur-sm"
-                  onClick={() => emit("rollDice")}
-                >
-                  Roll Dice
-                  {gameState.lastDiceRollWasDoubles && (
-                    <span className="block text-[10px] text-[#2a6050] font-normal mt-1 text-center tracking-widest">
-                      Doubles — Roll Again
-                    </span>
+                <div className="flex flex-col items-center gap-4">
+                  {gameState.diceRoll && (
+                    <div className="flex flex-col items-center gap-2">
+                      <div className="flex items-center gap-4">
+                        <Dice3D value={gameState.diceRoll[0]} />
+                        <Dice3D value={gameState.diceRoll[1]} />
+                      </div>
+                      {gameState.lastDiceRollWasDoubles && (
+                        <span className="text-[9px] text-[#2a6050] tracking-[0.25em] uppercase">
+                          doubles
+                        </span>
+                      )}
+                    </div>
                   )}
-                </button>
+                  {canRollDice && (
+                    <button
+                      className="bg-[#0c0e15]/90 hover:bg-[#111520] border border-[#1e2230] hover:border-[#2a3848] rounded-xl px-8 py-4 text-[10px] font-semibold tracking-[0.25em] uppercase text-[#3a5060] hover:text-slate-400 transition-all pointer-events-auto shadow-2xl backdrop-blur-sm"
+                      onClick={() => emit("rollDice")}
+                    >
+                      {gameState.lastDiceRollWasDoubles ? "Roll Again" : "Roll Dice"}
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
         </main>
-
-        {/* ── RIGHT: Transmission Log ─────────────────────────────── */}
-        <aside className="hidden md:flex flex-col w-64 shrink-0 border-l border-[#1a1f2c]">
-          <div className="flex items-center justify-between px-4 py-2.5 border-b border-[#1a1f2c] shrink-0">
-            <p className="text-[10px] text-[#2a3848] tracking-[0.25em] uppercase">
-              Transmission Log
-            </p>
-            <span className="font-mono text-[10px] text-[#1e2530]">
-              {String(gameState.log.length).padStart(3, "0")}:R
-            </span>
-          </div>
-          <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 flex flex-col gap-3">
-            {[...gameState.log].reverse().map((entry, i) => (
-              <div
-                key={i}
-                className="flex gap-2.5 border-b border-[#10131a] pb-2.5 last:border-0"
-              >
-                <span className="font-mono text-[10px] text-[#1e2530] shrink-0 mt-0.5 pt-px">
-                  {String(gameState.log.length - i).padStart(3, "0")}
-                </span>
-                <p className="text-xs text-[#3a4a5a] leading-relaxed">
-                  {entry}
-                </p>
-              </div>
-            ))}
-          </div>
-          {/* Initiate Transfer */}
-          <div className="shrink-0 border-t border-[#1a1f2c] p-3">
-            <button className="w-full flex items-center justify-center gap-2 text-[10px] tracking-[0.2em] uppercase py-2.5 rounded border border-[#1a1f2c] text-[#2a3848] hover:border-[#1e2a38] hover:text-[#3a4a5a] transition-colors">
-              <span className="font-mono">⇄</span>
-              <span>Initiate Transfer</span>
-            </button>
-          </div>
-        </aside>
       </div>
 
       {/* ── Bottom status bar ─────────────────────────────────────── */}
