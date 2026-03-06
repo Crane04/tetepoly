@@ -1,15 +1,15 @@
-import { create } from 'zustand';
-import type { GameState, Player, BoardSpace, Card, RoomInfo } from '../types';
-import { getSocket, connectSocket } from '../socket/socketClient';
+import { create } from "zustand";
+import type { GameState, Player, BoardSpace, Card, RoomInfo } from "../types";
+import { getSocket, connectSocket } from "../socket/socketClient";
 
 // ─── Name persistence (convenience only, not for identity) ───────────────────
 
 export function getSavedName(): string {
-  return localStorage.getItem('monopoly_player_name') ?? '';
+  return localStorage.getItem("monopoly_player_name") ?? "";
 }
 
 export function saveName(name: string): void {
-  localStorage.setItem('monopoly_player_name', name);
+  localStorage.setItem("monopoly_player_name", name);
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -22,15 +22,38 @@ interface LobbyPlayer {
 interface GameStore {
   // State
   gameState: GameState | null;
-  myPlayerId: string | null;          // player's name (= player.id in game)
+  myPlayerId: string | null; // player's name (= player.id in game)
   connected: boolean;
   lobbyPlayers: LobbyPlayer[];
-  currentGameId: string | null;       // roomId or gameCode
-  countdownEndsAt: number | null;     // ms timestamp for waiting-room countdown
+  currentGameId: string | null; // roomId or gameCode
+  countdownEndsAt: number | null; // ms timestamp for waiting-room countdown
   availableRooms: RoomInfo[];
-  pendingPropertyLanded: { playerId: string; position: number; space: BoardSpace } | null;
-  lastRentPaid: { fromId: string; toId: string; amount: number; position: number } | null;
-  lastCardDrawn: { playerId: string; deck: 'chance' | 'community_chest'; card: Card } | null;
+  pendingPropertyLanded: {
+    playerId: string;
+    position: number;
+    space: BoardSpace;
+  } | null;
+  queuedPropertyLanded: {
+    playerId: string;
+    position: number;
+    space: BoardSpace;
+  } | null;
+  lastRentPaid: {
+    fromId: string;
+    toId: string;
+    amount: number;
+    position: number;
+  } | null;
+  lastCardDrawn: {
+    playerId: string;
+    deck: "chance" | "community_chest";
+    card: Card;
+  } | null;
+  queuedCardDrawn: {
+    playerId: string;
+    deck: "chance" | "community_chest";
+    card: Card;
+  } | null;
   playerDisplayPositions: Record<string, number>;
   animatingPlayerIds: string[];
 
@@ -65,19 +88,60 @@ function animatePlayerMove(
     if (pos === to) break;
   }
 
-  set((s) => ({ animatingPlayerIds: [...new Set([...s.animatingPlayerIds, playerId])] }));
+  set((s) => ({
+    animatingPlayerIds: [...new Set([...s.animatingPlayerIds, playerId])],
+  }));
 
   steps.forEach((stepPos, i) => {
-    setTimeout(() => {
-      set((s) => ({
-        playerDisplayPositions: { ...s.playerDisplayPositions, [playerId]: stepPos },
-        animatingPlayerIds:
-          i === steps.length - 1
-            ? s.animatingPlayerIds.filter((id) => id !== playerId)
-            : s.animatingPlayerIds,
-      }));
-    }, (i + 1) * 200);
+    setTimeout(
+      () => {
+        set((s) => {
+          const isLast = i === steps.length - 1;
+          const queued =
+            isLast && s.queuedPropertyLanded?.playerId === playerId
+              ? s.queuedPropertyLanded
+              : null;
+          // Flush the queued card at the very last animation step — even if the card
+          // arrived after animation started (i.e. check live state, not a closure capture).
+          const queuedCard =
+            isLast && s.queuedCardDrawn?.playerId === playerId
+              ? s.queuedCardDrawn
+              : null;
+          return {
+            playerDisplayPositions: {
+              ...s.playerDisplayPositions,
+              [playerId]: stepPos,
+            },
+            animatingPlayerIds: isLast
+              ? s.animatingPlayerIds.filter((id) => id !== playerId)
+              : s.animatingPlayerIds,
+            ...(queued
+              ? { pendingPropertyLanded: queued, queuedPropertyLanded: null }
+              : {}),
+            ...(queuedCard
+              ? { lastCardDrawn: queuedCard, queuedCardDrawn: null }
+              : {}),
+          };
+        });
+      },
+      (i + 1) * 200,
+    );
   });
+
+  // Safety net: if the card arrives *after* the last setTimeout fires (e.g. slow network),
+  // watch for it and flush once animation is confirmed done.
+  const totalDuration = steps.length * 200 + 200;
+  setTimeout(() => {
+    set((s) => {
+      if (
+        s.queuedCardDrawn?.playerId === playerId &&
+        !s.animatingPlayerIds.includes(playerId)
+      ) {
+        return { lastCardDrawn: s.queuedCardDrawn, queuedCardDrawn: null };
+      }
+      return s;
+    });
+  }, totalDuration);
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -91,8 +155,10 @@ export const useGameStore = create<GameStore>((set, get) => ({
   countdownEndsAt: null,
   availableRooms: [],
   pendingPropertyLanded: null,
+  queuedPropertyLanded: null,
   lastRentPaid: null,
   lastCardDrawn: null,
+  queuedCardDrawn: null,
   playerDisplayPositions: {},
   animatingPlayerIds: [],
 
@@ -120,30 +186,37 @@ export const useGameStore = create<GameStore>((set, get) => ({
   leaveRoom: () => {
     const { currentGameId } = get();
     if (currentGameId) {
-      getSocket().emit('leaveGame', { gameId: currentGameId });
+      getSocket().emit("leaveGame", { gameId: currentGameId });
     }
-    set({ currentGameId: null, lobbyPlayers: [], countdownEndsAt: null, gameState: null, myPlayerId: null });
+    set({
+      currentGameId: null,
+      lobbyPlayers: [],
+      countdownEndsAt: null,
+      gameState: null,
+      myPlayerId: null,
+    });
   },
 
   initSocket: () => {
     const socket = getSocket();
 
-    socket.on('connect', () => {
+    socket.on("connect", () => {
       set({ connected: true });
-      socket.emit('listRooms');
+      socket.emit("listRooms");
     });
 
-    socket.on('disconnect', () => {
+    socket.on("disconnect", () => {
       set({ connected: false });
     });
 
-    socket.on('roomsList', (rooms: RoomInfo[]) => {
+    socket.on("roomsList", (rooms: RoomInfo[]) => {
       set({ availableRooms: rooms });
     });
 
     // Full state sync (in-game or reconnect)
-    socket.on('gameState', (state: GameState) => {
-      const { playerDisplayPositions, animatingPlayerIds } = get();
+    socket.on("gameState", (state: GameState) => {
+      const { playerDisplayPositions, animatingPlayerIds, queuedCardDrawn } =
+        get();
       const toAnimate: Array<{ id: string; from: number; to: number }> = [];
       const newDisplayPositions: Record<string, number> = {};
 
@@ -151,22 +224,46 @@ export const useGameStore = create<GameStore>((set, get) => ({
         const displayed = playerDisplayPositions[player.id];
         if (displayed === undefined) {
           newDisplayPositions[player.id] = player.position;
-        } else if (displayed !== player.position && !animatingPlayerIds.includes(player.id)) {
-          toAnimate.push({ id: player.id, from: displayed, to: player.position });
+        } else if (
+          displayed !== player.position &&
+          !animatingPlayerIds.includes(player.id)
+        ) {
+          toAnimate.push({
+            id: player.id,
+            from: displayed,
+            to: player.position,
+          });
           newDisplayPositions[player.id] = displayed;
         } else {
           newDisplayPositions[player.id] = displayed;
         }
       }
 
-      set({ gameState: state, playerDisplayPositions: newDisplayPositions, currentGameId: state.gameId });
+      set({
+        gameState: state,
+        playerDisplayPositions: newDisplayPositions,
+        currentGameId: state.gameId,
+      });
 
       for (const { id, from, to } of toAnimate) {
         animatePlayerMove(id, from, to, set);
       }
+
+      // Only flush the queued card once the player's token is fully at rest.
+      // Guard against both: a movement that is about to start (toAnimate) and one
+      // already in progress (animatingPlayerIds). In either case, animatePlayerMove
+      // will flush the card at its final step instead.
+      if (queuedCardDrawn) {
+        const playerIsMoving =
+          toAnimate.some((a) => a.id === queuedCardDrawn.playerId) ||
+          animatingPlayerIds.includes(queuedCardDrawn.playerId);
+        if (!playerIsMoving) {
+          set({ lastCardDrawn: queuedCardDrawn, queuedCardDrawn: null });
+        }
+      }
     });
 
-    socket.on('gameStarted', (state: GameState) => {
+    socket.on("gameStarted", (state: GameState) => {
       const displayPositions: Record<string, number> = {};
       for (const p of state.players) displayPositions[p.id] = p.position;
       set({
@@ -180,11 +277,26 @@ export const useGameStore = create<GameStore>((set, get) => ({
     });
 
     // Pre-game waiting room state
-    socket.on('roomState', ({ players, gameId, countdownEndsAt }: { players: LobbyPlayer[]; gameId: string; countdownEndsAt: number | null }) => {
-      set({ lobbyPlayers: players, currentGameId: gameId, countdownEndsAt: countdownEndsAt ?? null });
-    });
+    socket.on(
+      "roomState",
+      ({
+        players,
+        gameId,
+        countdownEndsAt,
+      }: {
+        players: LobbyPlayer[];
+        gameId: string;
+        countdownEndsAt: number | null;
+      }) => {
+        set({
+          lobbyPlayers: players,
+          currentGameId: gameId,
+          countdownEndsAt: countdownEndsAt ?? null,
+        });
+      },
+    );
 
-    socket.on('playerLeft', ({ playerId }: { playerId: string }) => {
+    socket.on("playerLeft", ({ playerId }: { playerId: string }) => {
       set((s) => {
         if (!s.gameState) return s;
         return {
@@ -198,29 +310,55 @@ export const useGameStore = create<GameStore>((set, get) => ({
       });
     });
 
-    socket.on('propertyLanded', (data: { playerId: string; position: number; space: BoardSpace }) => {
-      set({ pendingPropertyLanded: data });
-    });
+    socket.on(
+      "propertyLanded",
+      (data: { playerId: string; position: number; space: BoardSpace }) => {
+        const { myPlayerId, animatingPlayerIds } = get();
+        if (data.playerId !== myPlayerId) return;
+        if (animatingPlayerIds.includes(data.playerId)) {
+          set({ queuedPropertyLanded: data });
+        } else {
+          set({ pendingPropertyLanded: data });
+        }
+      },
+    );
 
-    socket.on('propertyBought', () => {
+    socket.on("propertyBought", () => {
       set({ pendingPropertyLanded: null });
     });
 
-    socket.on('auctionStarted', () => {
+    socket.on("auctionStarted", () => {
       set({ pendingPropertyLanded: null });
     });
 
-    socket.on('rentPaid', (data: { fromId: string; toId: string; amount: number; position: number }) => {
-      set({ lastRentPaid: data });
-    });
+    socket.on(
+      "rentPaid",
+      (data: {
+        fromId: string;
+        toId: string;
+        amount: number;
+        position: number;
+      }) => {
+        set({ lastRentPaid: data });
+      },
+    );
 
-    socket.on('cardDrawn', (data: { playerId: string; deck: 'chance' | 'community_chest'; card: Card }) => {
-      set({ lastCardDrawn: data });
-    });
+    socket.on(
+      "cardDrawn",
+      (data: {
+        playerId: string;
+        deck: "chance" | "community_chest";
+        card: Card;
+      }) => {
+        // Always queue — the gameState event (which triggers animation) hasn't arrived yet,
+        // so animatingPlayerIds would be empty even if movement is about to start.
+        set({ queuedCardDrawn: data });
+      },
+    );
 
-    socket.on('error', ({ message }: { message: string }) => {
-      console.error('[Server error]', message);
-      if (message.includes('not found') || message.includes('full')) {
+    socket.on("error", ({ message }: { message: string }) => {
+      console.error("[Server error]", message);
+      if (message.includes("not found") || message.includes("full")) {
         set({ currentGameId: null, lobbyPlayers: [], countdownEndsAt: null });
       }
     });
