@@ -128,7 +128,7 @@ export interface TradeOffer {
 // ─── Socket Event Payloads ───────────────────────────────────────────────────
 
 // Client → Server
-export interface JoinGamePayload { gameId: string; playerName: string; token: string; }
+export interface JoinGamePayload { gameId: string; playerName: string; }
 export interface StartGamePayload { gameId: string; }
 export interface RollDicePayload { gameId: string; }
 export interface BuyPropertyPayload { gameId: string; position: number; }

@@ -8,7 +8,7 @@ const http_1 = require("http");
 const socket_io_1 = require("socket.io");
 const cors_1 = __importDefault(require("cors"));
 const socket_1 = require("./socket");
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 4000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 4200;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? 'http://localhost:5173';
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)({ origin: CLIENT_ORIGIN }));

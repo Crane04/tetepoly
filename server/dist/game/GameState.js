@@ -31,13 +31,13 @@ const Board_1 = require("./Board");
 const Cards_1 = require("./Cards");
 const RentCalculator_1 = require("./RentCalculator");
 // ─── Initialization ──────────────────────────────────────────────────────────
-function initGameState(players) {
+function initGameState(players, startingMoney = 1500) {
     const initialPlayers = players.map((p) => ({
         id: p.id,
         name: p.name,
         token: p.token,
         position: 0,
-        money: 1500,
+        money: startingMoney,
         properties: [],
         inJail: false,
         jailTurnsRemaining: 0,

@@ -1,9 +1,20 @@
 import { create } from 'zustand';
-import type { GameState, Player, BoardSpace, Card } from '../types';
+import type { GameState, Player, BoardSpace, Card, RoomInfo } from '../types';
 import { getSocket, connectSocket } from '../socket/socketClient';
 
+// ─── Name persistence (convenience only, not for identity) ───────────────────
+
+export function getSavedName(): string {
+  return localStorage.getItem('monopoly_player_name') ?? '';
+}
+
+export function saveName(name: string): void {
+  localStorage.setItem('monopoly_player_name', name);
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 interface LobbyPlayer {
-  id: string;
   name: string;
   token: string;
 }
@@ -11,10 +22,12 @@ interface LobbyPlayer {
 interface GameStore {
   // State
   gameState: GameState | null;
-  myPlayerId: string | null;
+  myPlayerId: string | null;          // player's name (= player.id in game)
   connected: boolean;
   lobbyPlayers: LobbyPlayer[];
-  lobbyHostId: string | null;
+  currentGameId: string | null;       // roomId or gameCode
+  countdownEndsAt: number | null;     // ms timestamp for waiting-room countdown
+  availableRooms: RoomInfo[];
   pendingPropertyLanded: { playerId: string; position: number; space: BoardSpace } | null;
   lastRentPaid: { fromId: string; toId: string; amount: number; position: number } | null;
   lastCardDrawn: { playerId: string; deck: 'chance' | 'community_chest'; card: Card } | null;
@@ -29,12 +42,14 @@ interface GameStore {
   clearPendingProperty: () => void;
   clearRentPaid: () => void;
   clearCardDrawn: () => void;
+  leaveRoom: () => void;
 
   // Socket initializer
   initSocket: () => void;
 }
 
-// Animate a player token from one board position to another, stepping clockwise.
+// ─── Token animation ──────────────────────────────────────────────────────────
+
 function animatePlayerMove(
   playerId: string,
   from: number,
@@ -65,12 +80,16 @@ function animatePlayerMove(
   });
 }
 
+// ─── Store ────────────────────────────────────────────────────────────────────
+
 export const useGameStore = create<GameStore>((set, get) => ({
   gameState: null,
   myPlayerId: null,
   connected: false,
   lobbyPlayers: [],
-  lobbyHostId: null,
+  currentGameId: null,
+  countdownEndsAt: null,
+  availableRooms: [],
   pendingPropertyLanded: null,
   lastRentPaid: null,
   lastCardDrawn: null,
@@ -93,71 +112,76 @@ export const useGameStore = create<GameStore>((set, get) => ({
     }),
 
   setConnected: (connected) => set({ connected }),
-
   setMyPlayerId: (id) => set({ myPlayerId: id }),
-
   clearPendingProperty: () => set({ pendingPropertyLanded: null }),
-
   clearRentPaid: () => set({ lastRentPaid: null }),
-
   clearCardDrawn: () => set({ lastCardDrawn: null }),
+
+  leaveRoom: () => {
+    const { currentGameId } = get();
+    if (currentGameId) {
+      getSocket().emit('leaveGame', { gameId: currentGameId });
+    }
+    set({ currentGameId: null, lobbyPlayers: [], countdownEndsAt: null, gameState: null, myPlayerId: null });
+  },
 
   initSocket: () => {
     const socket = getSocket();
 
     socket.on('connect', () => {
-      set({ connected: true, myPlayerId: socket.id ?? null });
+      set({ connected: true });
+      socket.emit('listRooms');
     });
 
     socket.on('disconnect', () => {
       set({ connected: false });
     });
 
-    // Full state syncs — preserve display positions; start animations for moved players
+    socket.on('roomsList', (rooms: RoomInfo[]) => {
+      set({ availableRooms: rooms });
+    });
+
+    // Full state sync (in-game or reconnect)
     socket.on('gameState', (state: GameState) => {
       const { playerDisplayPositions, animatingPlayerIds } = get();
-
-      // Capture which players moved (compare current display → new actual)
       const toAnimate: Array<{ id: string; from: number; to: number }> = [];
       const newDisplayPositions: Record<string, number> = {};
 
       for (const player of state.players) {
         const displayed = playerDisplayPositions[player.id];
         if (displayed === undefined) {
-          // First time: place at actual position
           newDisplayPositions[player.id] = player.position;
-        } else if (
-          displayed !== player.position &&
-          !animatingPlayerIds.includes(player.id)
-        ) {
-          // Player moved and not already animating — queue animation
+        } else if (displayed !== player.position && !animatingPlayerIds.includes(player.id)) {
           toAnimate.push({ id: player.id, from: displayed, to: player.position });
-          // Keep the current displayed position; animation will advance it
           newDisplayPositions[player.id] = displayed;
         } else {
-          // Either not moved or already animating — preserve displayed position
           newDisplayPositions[player.id] = displayed;
         }
       }
 
-      set({ gameState: state, playerDisplayPositions: newDisplayPositions });
+      set({ gameState: state, playerDisplayPositions: newDisplayPositions, currentGameId: state.gameId });
 
-      // Start step-by-step animations
       for (const { id, from, to } of toAnimate) {
         animatePlayerMove(id, from, to, set);
       }
     });
 
     socket.on('gameStarted', (state: GameState) => {
-      // Initialize display positions for all players at their starting positions
       const displayPositions: Record<string, number> = {};
       for (const p of state.players) displayPositions[p.id] = p.position;
-      set({ gameState: state, lobbyPlayers: [], lobbyHostId: null, playerDisplayPositions: displayPositions, animatingPlayerIds: [] });
+      set({
+        gameState: state,
+        currentGameId: state.gameId,
+        lobbyPlayers: [],
+        countdownEndsAt: null,
+        playerDisplayPositions: displayPositions,
+        animatingPlayerIds: [],
+      });
     });
 
-    // Pre-game lobby — server sends full pending player list on each join
-    socket.on('roomState', ({ players, hostId }: { players: LobbyPlayer[]; hostId: string; gameId: string }) => {
-      set({ lobbyPlayers: players, lobbyHostId: hostId });
+    // Pre-game waiting room state
+    socket.on('roomState', ({ players, gameId, countdownEndsAt }: { players: LobbyPlayer[]; gameId: string; countdownEndsAt: number | null }) => {
+      set({ lobbyPlayers: players, currentGameId: gameId, countdownEndsAt: countdownEndsAt ?? null });
     });
 
     socket.on('playerLeft', ({ playerId }: { playerId: string }) => {
@@ -196,6 +220,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
     socket.on('error', ({ message }: { message: string }) => {
       console.error('[Server error]', message);
+      if (message.includes('not found') || message.includes('full')) {
+        set({ currentGameId: null, lobbyPlayers: [], countdownEndsAt: null });
+      }
     });
 
     connectSocket();

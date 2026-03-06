@@ -1,19 +1,28 @@
 import { Server, Socket } from 'socket.io';
 import { GameState, Trade } from '../types';
 import {
-  getOrCreateRoom,
   getRoom,
   addPlayerToRoom,
+  removePlayerFromRoom,
   startGame,
   getGame,
   setGame,
+  getRoomList,
+  getRoomPendingPlayers,
+  getRoomPendingSocketIds,
+  registerSocket,
+  unregisterSocket,
+  getPlayerIdFromSocket,
+  getLocationForPlayer,
+  setRoomCountdown,
+  clearRoomCountdown,
+  getRoomCountdownEndsAt,
 } from '../game/GameManager';
 import {
   currentPlayer,
   getPlayerById,
   getSpace,
   movePlayer,
-  movePlayerTo,
   payRent,
   buyProperty,
   buildHouse,
@@ -36,9 +45,10 @@ import {
   advanceTurn,
 } from '../game/GameState';
 import { rollDice, isDoubles } from '../game/Dice';
-import { getNearestOf } from '../game/RentCalculator';
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+const COUNTDOWN_SECONDS = 30;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function emit(io: Server, gameId: string, state: GameState) {
   io.to(gameId).emit('gameState', state);
@@ -48,30 +58,90 @@ function err(socket: Socket, message: string) {
   socket.emit('error', { message });
 }
 
+function guardAuth(socket: Socket): string | null {
+  const playerId = getPlayerIdFromSocket(socket.id);
+  if (!playerId) { err(socket, 'Not authenticated.'); return null; }
+  return playerId;
+}
+
 function guardGame(socket: Socket, gameId: string): GameState | null {
   const game = getGame(gameId);
-  if (!game) {
-    err(socket, 'Game not found.');
-    return null;
-  }
+  if (!game) { err(socket, 'Game not found.'); return null; }
   return game;
 }
 
 function guardTurn(socket: Socket, game: GameState, playerId: string): boolean {
   const cp = currentPlayer(game);
-  if (cp.id !== playerId) {
-    err(socket, 'Not your turn.');
-    return false;
-  }
+  if (cp.id !== playerId) { err(socket, 'Not your turn.'); return false; }
   return true;
 }
 
 function guardStarted(socket: Socket, game: GameState): boolean {
-  if (game.status !== 'started') {
-    err(socket, 'Game is not in progress.');
-    return false;
-  }
+  if (game.status !== 'started') { err(socket, 'Game is not in progress.'); return false; }
   return true;
+}
+
+// ─── Timer Management ─────────────────────────────────────────────────────────
+
+const roomTimers = new Map<string, NodeJS.Timeout>();
+
+function broadcastRoomState(roomId: string, io: Server) {
+  const room = getRoom(roomId);
+  if (!room) return;
+  io.to(roomId).emit('roomState', {
+    gameId: roomId,
+    players: getRoomPendingPlayers(roomId),
+    countdownEndsAt: getRoomCountdownEndsAt(roomId),
+  });
+}
+
+function scheduleAutoStart(roomId: string, io: Server) {
+  if (roomTimers.has(roomId)) return; // already running
+  const endsAt = Date.now() + COUNTDOWN_SECONDS * 1000;
+  setRoomCountdown(roomId, endsAt);
+  const timer = setTimeout(() => {
+    roomTimers.delete(roomId);
+    clearRoomCountdown(roomId);
+    autoStartGame(roomId, io);
+  }, COUNTDOWN_SECONDS * 1000);
+  roomTimers.set(roomId, timer);
+  broadcastRoomState(roomId, io);
+  io.emit('roomsList', getRoomList());
+}
+
+function cancelAutoStart(roomId: string, io: Server) {
+  const timer = roomTimers.get(roomId);
+  if (timer) {
+    clearTimeout(timer);
+    roomTimers.delete(roomId);
+    clearRoomCountdown(roomId);
+  }
+}
+
+function autoStartGame(roomId: string, io: Server) {
+  const result = startGame(roomId);
+  if (typeof result === 'string') {
+    // Not enough players — reset and let waiting room know
+    broadcastRoomState(roomId, io);
+    io.emit('roomsList', getRoomList());
+    return;
+  }
+
+  const { game, socketIds } = result;
+  const gameCode = game.gameId;
+
+  // Move each waiting-room socket to the game socket room
+  for (const socketId of socketIds) {
+    const s = io.sockets.sockets.get(socketId);
+    if (s) {
+      s.leave(roomId);
+      s.join(gameCode);
+    }
+  }
+
+  io.to(gameCode).emit('gameStarted', game);
+  io.to(gameCode).emit('gameState', game);
+  io.emit('roomsList', getRoomList());
 }
 
 // After rolling, resolve the space the player is on
@@ -92,12 +162,11 @@ function resolveSpace(
     playerId,
     from: player.position,
     to: position,
-    passedGo: false, // already notified via movePlayer
+    passedGo: false,
   });
 
   switch (space.type) {
     case 'go':
-      // $200 already collected in movePlayer
       break;
 
     case 'go_to_jail':
@@ -116,20 +185,11 @@ function resolveSpace(
       const overrides = applyCard(game, playerId, card, diceTotal);
       io.to(game.gameId).emit('cardDrawn', { playerId, deck: space.type, card });
 
-      // If card moved player to a new space, resolve that space too
       if (card.action === 'advance_to' || card.action === 'advance_to_nearest') {
         if (card.action === 'advance_to' && player.position !== position) {
-          resolveSpace(
-            io, socket, game, playerId, diceTotal,
-            overrides.rentDoubled ?? false,
-            overrides.utilityMultiplier,
-          );
+          resolveSpace(io, socket, game, playerId, diceTotal, overrides.rentDoubled ?? false, overrides.utilityMultiplier);
         } else if (card.action === 'advance_to_nearest') {
-          resolveSpace(
-            io, socket, game, playerId, diceTotal,
-            overrides.rentDoubled ?? false,
-            overrides.utilityMultiplier,
-          );
+          resolveSpace(io, socket, game, playerId, diceTotal, overrides.rentDoubled ?? false, overrides.utilityMultiplier);
         }
       }
       break;
@@ -139,19 +199,13 @@ function resolveSpace(
     case 'railroad':
     case 'utility': {
       if (!space.ownerId) {
-        // Offer to buy
         io.to(game.gameId).emit('propertyLanded', { playerId, position, space });
       } else if (space.ownerId !== playerId) {
         const owner = getPlayerById(game, space.ownerId);
         if (owner && !owner.isBankrupt) {
           const amount = payRent(game, playerId, position, diceTotal, doubleRent, utilityMultiplier);
           if (amount > 0) {
-            io.to(game.gameId).emit('rentPaid', {
-              fromId: playerId,
-              toId: space.ownerId,
-              amount,
-              position,
-            });
+            io.to(game.gameId).emit('rentPaid', { fromId: playerId, toId: space.ownerId, amount, position });
           }
         }
       }
@@ -165,51 +219,61 @@ function resolveSpace(
   }
 }
 
-// ─── Register all socket events ──────────────────────────────────────────────
+// ─── Register all socket events ───────────────────────────────────────────────
 
 export function registerSocketHandlers(io: Server): void {
   io.on('connection', (socket: Socket) => {
-    const socketPlayerId = socket.id;
 
-    // ── joinGame ────────────────────────────────────────────────────────────
-    socket.on('joinGame', ({ gameId, playerName, token }: { gameId: string; playerName: string; token: string }) => {
-      getOrCreateRoom(gameId, socketPlayerId);
-      const joinErr = addPlayerToRoom(gameId, { id: socketPlayerId, name: playerName, token });
-      if (joinErr) return err(socket, joinErr);
+    // ── listRooms ────────────────────────────────────────────────────────────
+    socket.on('listRooms', () => {
+      socket.emit('roomsList', getRoomList());
+    });
 
-      socket.join(gameId);
+    // ── joinGame ─────────────────────────────────────────────────────────────
+    // gameId can be a roomId (room-1…) or a gameCode (ABC123)
+    socket.on('joinGame', ({ gameId, playerName }: { gameId: string; playerName: string }) => {
+      if (!playerName?.trim()) return err(socket, 'Player name is required.');
+      const name = playerName.trim();
 
+      // Check if it's an active game (reconnect)
       const game = getGame(gameId);
       if (game) {
+        const player = game.players.find((p) => p.id === name);
+        if (!player) return err(socket, 'You are not in this game.');
+        registerSocket(socket.id, name);
+        socket.join(gameId);
+        player.isConnected = true;
+        setGame(gameId, game);
         socket.emit('gameState', game);
         return;
       }
 
-      // Game not started yet — broadcast the full lobby state so all clients
-      // can display the correct player list and know who the host is.
-      const room = getRoom(gameId)!;
-      io.to(gameId).emit('roomState', {
-        gameId,
-        hostId: room.hostId,
-        players: room.pendingPlayers,
-      });
+      // Otherwise treat as a room join (waiting queue)
+      const room = getRoom(gameId);
+      if (!room) return err(socket, 'Room not found.');
+
+      const joinErr = addPlayerToRoom(gameId, { name, socketId: socket.id });
+      if (joinErr) return err(socket, joinErr);
+
+      socket.join(gameId);
+
+      broadcastRoomState(gameId, io);
+      io.emit('roomsList', getRoomList());
+
+      // Start countdown once we have ≥2 players
+      if (room.pendingPlayers.length >= 2) {
+        scheduleAutoStart(gameId, io);
+      }
     });
 
-    // ── startGame ───────────────────────────────────────────────────────────
-    socket.on('startGame', ({ gameId }: { gameId: string }) => {
-      const result = startGame(gameId, socketPlayerId);
-      if (typeof result === 'string') return err(socket, result);
-
-      io.to(gameId).emit('gameStarted', result);
-      emit(io, gameId, result);
-    });
-
-    // ── rollDice ────────────────────────────────────────────────────────────
+    // ── rollDice ─────────────────────────────────────────────────────────────
     socket.on('rollDice', ({ gameId }: { gameId: string }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
       const player = currentPlayer(game);
 
@@ -219,31 +283,24 @@ export function registerSocketHandlers(io: Server): void {
         const total = dice[0] + dice[1];
         game.diceRoll = dice;
 
-        io.to(gameId).emit('diceRolled', {
-          playerId: socketPlayerId,
-          dice,
-          total,
-          isDoubles: isDoubles(dice),
-        });
+        io.to(gameId).emit('diceRolled', { playerId, dice, total, isDoubles: isDoubles(dice) });
 
         if (isDoubles(dice)) {
-          exitJail(game, socketPlayerId, 'roll');
-          io.to(gameId).emit('jailExited', { playerId: socketPlayerId, method: 'roll' });
-          movePlayer(game, socketPlayerId, total);
-          resolveSpace(io, socket, game, socketPlayerId, total);
+          exitJail(game, playerId, 'roll');
+          io.to(gameId).emit('jailExited', { playerId, method: 'roll' });
+          movePlayer(game, playerId, total);
+          resolveSpace(io, socket, game, playerId, total);
         } else {
           player.jailTurnsRemaining -= 1;
           if (player.jailTurnsRemaining <= 0) {
-            // Force pay fine and move
             if (player.money >= 50) {
               player.money -= 50;
-              exitJail(game, socketPlayerId, 'fine');
-              io.to(gameId).emit('jailExited', { playerId: socketPlayerId, method: 'fine' });
+              exitJail(game, playerId, 'fine');
+              io.to(gameId).emit('jailExited', { playerId, method: 'fine' });
             }
-            movePlayer(game, socketPlayerId, total);
-            resolveSpace(io, socket, game, socketPlayerId, total);
+            movePlayer(game, playerId, total);
+            resolveSpace(io, socket, game, playerId, total);
           }
-          // else: stay in jail, turn ends
         }
         setGame(gameId, game);
         emit(io, gameId, game);
@@ -260,10 +317,9 @@ export function registerSocketHandlers(io: Server): void {
       if (doubles) {
         game.doublesCount += 1;
         if (game.doublesCount >= 3) {
-          // Three doubles — go to jail
-          sendToJail(game, socketPlayerId);
-          io.to(gameId).emit('diceRolled', { playerId: socketPlayerId, dice, total, isDoubles: true });
-          io.to(gameId).emit('jailEntered', { playerId: socketPlayerId });
+          sendToJail(game, playerId);
+          io.to(gameId).emit('diceRolled', { playerId, dice, total, isDoubles: true });
+          io.to(gameId).emit('jailEntered', { playerId });
           setGame(gameId, game);
           emit(io, gameId, game);
           return;
@@ -272,35 +328,39 @@ export function registerSocketHandlers(io: Server): void {
         game.doublesCount = 0;
       }
 
-      io.to(gameId).emit('diceRolled', { playerId: socketPlayerId, dice, total, isDoubles: doubles });
-      movePlayer(game, socketPlayerId, total);
-      resolveSpace(io, socket, game, socketPlayerId, total);
+      io.to(gameId).emit('diceRolled', { playerId, dice, total, isDoubles: doubles });
+      movePlayer(game, playerId, total);
+      resolveSpace(io, socket, game, playerId, total);
 
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── buyProperty ─────────────────────────────────────────────────────────
+    // ── buyProperty ──────────────────────────────────────────────────────────
     socket.on('buyProperty', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const ok = buyProperty(game, socketPlayerId, position);
+      const ok = buyProperty(game, playerId, position);
       if (!ok) return err(socket, 'Cannot buy this property.');
 
-      io.to(gameId).emit('propertyBought', { playerId: socketPlayerId, position });
+      io.to(gameId).emit('propertyBought', { playerId, position });
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── declineBuy ──────────────────────────────────────────────────────────
+    // ── declineBuy ───────────────────────────────────────────────────────────
     socket.on('declineBuy', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
       startAuction(game, position);
       io.to(gameId).emit('auctionStarted', { auction: game.auction });
@@ -308,13 +368,15 @@ export function registerSocketHandlers(io: Server): void {
       emit(io, gameId, game);
     });
 
-    // ── placeBid ────────────────────────────────────────────────────────────
+    // ── placeBid ─────────────────────────────────────────────────────────────
     socket.on('placeBid', ({ gameId, amount }: { gameId: string; amount: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
 
-      const bidErr = placeBid(game, socketPlayerId, amount);
+      const bidErr = placeBid(game, playerId, amount);
       if (bidErr) return err(socket, bidErr);
 
       io.to(gameId).emit('auctionBid', { auction: game.auction });
@@ -322,13 +384,15 @@ export function registerSocketHandlers(io: Server): void {
       emit(io, gameId, game);
     });
 
-    // ── withdrawFromAuction ─────────────────────────────────────────────────
+    // ── withdrawFromAuction ──────────────────────────────────────────────────
     socket.on('withdrawFromAuction', ({ gameId }: { gameId: string }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
 
-      withdrawFromAuction(game, socketPlayerId);
+      withdrawFromAuction(game, playerId);
 
       const remaining = game.auction?.activeBidders ?? [];
       if (remaining.length <= 1) {
@@ -341,101 +405,115 @@ export function registerSocketHandlers(io: Server): void {
       emit(io, gameId, game);
     });
 
-    // ── buildHouse ──────────────────────────────────────────────────────────
+    // ── buildHouse ───────────────────────────────────────────────────────────
     socket.on('buildHouse', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const buildErr = buildHouse(game, socketPlayerId, position);
+      const buildErr = buildHouse(game, playerId, position);
       if (buildErr) return err(socket, buildErr);
 
-      io.to(gameId).emit('houseBuilt', { playerId: socketPlayerId, position });
+      io.to(gameId).emit('houseBuilt', { playerId, position });
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── buildHotel ──────────────────────────────────────────────────────────
+    // ── buildHotel ───────────────────────────────────────────────────────────
     socket.on('buildHotel', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const buildErr = buildHotel(game, socketPlayerId, position);
+      const buildErr = buildHotel(game, playerId, position);
       if (buildErr) return err(socket, buildErr);
 
-      io.to(gameId).emit('hotelBuilt', { playerId: socketPlayerId, position });
+      io.to(gameId).emit('hotelBuilt', { playerId, position });
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── sellHouse ───────────────────────────────────────────────────────────
+    // ── sellHouse ────────────────────────────────────────────────────────────
     socket.on('sellHouse', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const sellErr = sellHouse(game, socketPlayerId, position);
+      const sellErr = sellHouse(game, playerId, position);
       if (sellErr) return err(socket, sellErr);
 
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── sellHotel ───────────────────────────────────────────────────────────
+    // ── sellHotel ────────────────────────────────────────────────────────────
     socket.on('sellHotel', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const sellErr = sellHotel(game, socketPlayerId, position);
+      const sellErr = sellHotel(game, playerId, position);
       if (sellErr) return err(socket, sellErr);
 
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── mortgageProperty ────────────────────────────────────────────────────
+    // ── mortgageProperty ─────────────────────────────────────────────────────
     socket.on('mortgageProperty', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const mortErr = mortgageProperty(game, socketPlayerId, position);
+      const mortErr = mortgageProperty(game, playerId, position);
       if (mortErr) return err(socket, mortErr);
 
-      io.to(gameId).emit('propertyMortgaged', { playerId: socketPlayerId, position });
+      io.to(gameId).emit('propertyMortgaged', { playerId, position });
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── unmortgageProperty ──────────────────────────────────────────────────
+    // ── unmortgageProperty ───────────────────────────────────────────────────
     socket.on('unmortgageProperty', ({ gameId, position }: { gameId: string; position: number }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const unErr = unmortgageProperty(game, socketPlayerId, position);
+      const unErr = unmortgageProperty(game, playerId, position);
       if (unErr) return err(socket, unErr);
 
-      io.to(gameId).emit('propertyUnmortgaged', { playerId: socketPlayerId, position });
+      io.to(gameId).emit('propertyUnmortgaged', { playerId, position });
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── proposeTrade ────────────────────────────────────────────────────────
+    // ── proposeTrade ─────────────────────────────────────────────────────────
     socket.on('proposeTrade', ({ gameId, trade }: { gameId: string; trade: Trade }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
 
-      const tradeErr = proposeTrade(game, { ...trade, fromPlayerId: socketPlayerId });
+      const tradeErr = proposeTrade(game, { ...trade, fromPlayerId: playerId });
       if (tradeErr) return err(socket, tradeErr);
 
       io.to(gameId).emit('tradeProposed', { trade: game.activeTrade });
@@ -443,15 +521,17 @@ export function registerSocketHandlers(io: Server): void {
       emit(io, gameId, game);
     });
 
-    // ── respondTrade ────────────────────────────────────────────────────────
+    // ── respondTrade ─────────────────────────────────────────────────────────
     socket.on('respondTrade', ({ gameId, accept }: { gameId: string; accept: boolean }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
 
       const trade = game.activeTrade;
       if (!trade) return err(socket, 'No active trade.');
-      if (trade.toPlayerId !== socketPlayerId) return err(socket, 'Trade not addressed to you.');
+      if (trade.toPlayerId !== playerId) return err(socket, 'Trade not addressed to you.');
 
       if (accept) {
         const execErr = executeTrade(game);
@@ -467,65 +547,70 @@ export function registerSocketHandlers(io: Server): void {
       emit(io, gameId, game);
     });
 
-    // ── payJailFine ─────────────────────────────────────────────────────────
+    // ── payJailFine ──────────────────────────────────────────────────────────
     socket.on('payJailFine', ({ gameId }: { gameId: string }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const jailErr = exitJail(game, socketPlayerId, 'fine');
+      const jailErr = exitJail(game, playerId, 'fine');
       if (jailErr) return err(socket, jailErr);
 
-      io.to(gameId).emit('jailExited', { playerId: socketPlayerId, method: 'fine' });
+      io.to(gameId).emit('jailExited', { playerId, method: 'fine' });
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── useJailCard ─────────────────────────────────────────────────────────
+    // ── useJailCard ──────────────────────────────────────────────────────────
     socket.on('useJailCard', ({ gameId }: { gameId: string }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      const jailErr = exitJail(game, socketPlayerId, 'card');
+      const jailErr = exitJail(game, playerId, 'card');
       if (jailErr) return err(socket, jailErr);
 
-      io.to(gameId).emit('jailExited', { playerId: socketPlayerId, method: 'card' });
+      io.to(gameId).emit('jailExited', { playerId, method: 'card' });
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── declareBankruptcy ───────────────────────────────────────────────────
+    // ── declareBankruptcy ────────────────────────────────────────────────────
     socket.on('declareBankruptcy', ({ gameId }: { gameId: string }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
 
-      // Determine creditor from context (simplify: pass null for bank bankruptcy)
-      // In a full implementation the client would pass creditorId
-      declareBankruptcy(game, socketPlayerId, null);
-
-      io.to(gameId).emit('playerBankrupt', { playerId: socketPlayerId, creditorId: null });
+      declareBankruptcy(game, playerId, null);
+      io.to(gameId).emit('playerBankrupt', { playerId, creditorId: null });
 
       if (game.status === 'ended' && game.winner) {
         const winner = getPlayerById(game, game.winner)!;
         io.to(gameId).emit('gameOver', { winnerId: game.winner, winnerName: winner.name });
+        io.emit('roomsList', getRoomList());
       }
 
       setGame(gameId, game);
       emit(io, gameId, game);
     });
 
-    // ── endTurn ─────────────────────────────────────────────────────────────
+    // ── endTurn ──────────────────────────────────────────────────────────────
     socket.on('endTurn', ({ gameId }: { gameId: string }) => {
+      const playerId = guardAuth(socket);
+      if (!playerId) return;
       const game = guardGame(socket, gameId);
       if (!game) return;
       if (!guardStarted(socket, game)) return;
-      if (!guardTurn(socket, game, socketPlayerId)) return;
+      if (!guardTurn(socket, game, playerId)) return;
 
-      // If last roll was doubles and player is not in jail, they must roll again
       if (game.lastDiceRollWasDoubles && !currentPlayer(game).inJail) {
         return err(socket, 'You rolled doubles — you must roll again.');
       }
@@ -535,23 +620,65 @@ export function registerSocketHandlers(io: Server): void {
       emit(io, gameId, game);
     });
 
-    // ── leaveGame ───────────────────────────────────────────────────────────
+    // ── leaveGame ────────────────────────────────────────────────────────────
     socket.on('leaveGame', ({ gameId }: { gameId: string }) => {
+      const playerName = getPlayerIdFromSocket(socket.id);
       socket.leave(gameId);
+
+      // Check if this is a waiting room leave
+      const room = getRoom(gameId);
+      if (room && playerName) {
+        removePlayerFromRoom(gameId, playerName);
+        if (room.pendingPlayers.length < 2) {
+          cancelAutoStart(gameId, io);
+        }
+        broadcastRoomState(gameId, io);
+        io.emit('roomsList', getRoomList());
+        return;
+      }
+
+      // In-game leave
       const game = getGame(gameId);
-      if (game) {
-        const player = getPlayerById(game, socketPlayerId);
+      if (game && playerName) {
+        const player = getPlayerById(game, playerName);
         if (player) player.isConnected = false;
         setGame(gameId, game);
-        io.to(gameId).emit('playerLeft', { playerId: socketPlayerId });
+        io.to(gameId).emit('playerLeft', { playerId: playerName });
         emit(io, gameId, game);
       }
+      io.emit('roomsList', getRoomList());
     });
 
-    // ── disconnect ──────────────────────────────────────────────────────────
+    // ── disconnect ───────────────────────────────────────────────────────────
     socket.on('disconnect', () => {
-      // Mark disconnected in any active game rooms
-      // (Room tracking would need socket→gameId map for full impl)
+      const playerName = getPlayerIdFromSocket(socket.id);
+      if (!playerName) { unregisterSocket(socket.id); return; }
+
+      const locationId = getLocationForPlayer(playerName);
+      if (locationId) {
+        const game = getGame(locationId);
+        if (game) {
+          // In an active game
+          const player = game.players.find((p) => p.id === playerName);
+          if (player) {
+            player.isConnected = false;
+            setGame(locationId, game);
+            io.to(locationId).emit('playerLeft', { playerId: playerName });
+            emit(io, locationId, game);
+          }
+        } else {
+          // In a waiting room
+          removePlayerFromRoom(locationId, playerName);
+          const room = getRoom(locationId);
+          if ((room?.pendingPlayers.length ?? 0) < 2) {
+            cancelAutoStart(locationId, io);
+          }
+          broadcastRoomState(locationId, io);
+          io.emit('roomsList', getRoomList());
+        }
+      }
+
+      unregisterSocket(socket.id);
     });
   });
 }

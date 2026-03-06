@@ -16,13 +16,14 @@ import { calculateRent, didPassGo, getNearestOf } from "./RentCalculator";
 
 export function initGameState(
   players: Array<{ id: string; name: string; token: string }>,
+  startingMoney = 1500,
 ): GameState {
   const initialPlayers: Player[] = players.map((p) => ({
     id: p.id,
     name: p.name,
     token: p.token,
     position: 0,
-    money: 1500,
+    money: startingMoney,
     properties: [],
     inJail: false,
     jailTurnsRemaining: 0,

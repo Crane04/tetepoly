@@ -125,10 +125,23 @@ export interface TradeOffer {
   getOutOfJailCards: number;
 }
 
+// ─── Room ─────────────────────────────────────────────────────────────────────
+
+export interface RoomInfo {
+  id: string;
+  name: string;
+  startingMoney: number;
+  capacity: number;
+  playerCount: number;    // players in active game
+  waitingCount: number;   // players queued for next game
+  status: 'waiting' | 'started' | 'ended';
+  countdownEndsAt: number | null; // ms timestamp, null = no countdown
+}
+
 // ─── Socket Event Payloads ───────────────────────────────────────────────────
 
 // Client → Server
-export interface JoinGamePayload { gameId: string; playerName: string; token: string; }
+export interface JoinGamePayload { gameId: string; playerName: string; }
 export interface StartGamePayload { gameId: string; }
 export interface RollDicePayload { gameId: string; }
 export interface BuyPropertyPayload { gameId: string; position: number; }

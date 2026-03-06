@@ -2,6 +2,7 @@
 export type {
   GameState,
   Player,
+  RoomInfo,
   BoardSpace,
   SpaceType,
   Bank,
