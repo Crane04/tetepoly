@@ -4,7 +4,6 @@ import {
   Player,
   BoardSpace,
   Card,
-  Auction,
   Trade,
   TradeOffer,
 } from "../types";
@@ -32,6 +31,7 @@ export function initGameState(
     isConnected: true,
   }));
 
+  const now = Date.now();
   return {
     gameId: uuidv4(),
     status: "started",
@@ -41,13 +41,15 @@ export function initGameState(
     chanceDeck: initChanceDeck(),
     communityChestDeck: initCommunityChestDeck(),
     bank: { houses: 32, hotels: 12 },
-    auction: null,
     activeTrade: null,
     diceRoll: null,
     doublesCount: 0,
     lastDiceRollWasDoubles: false,
     winner: null,
+    winners: null,
     log: ["Game started!"],
+    gameEndsAt: now + 15 * 60 * 1000, // 15-minute game timer
+    turnEndsAt: now + 20 * 1000, // 20-second turn timer for first player
   };
 }
 
@@ -517,79 +519,6 @@ export function exitJail(
   return null;
 }
 
-// ─── Auction ─────────────────────────────────────────────────────────────────
-
-export function startAuction(state: GameState, position: number): void {
-  const active = activePlayers(state).map((p) => p.id);
-  state.auction = {
-    propertyPosition: position,
-    highestBid: 0,
-    highestBidderId: null,
-    activeBidders: active,
-  };
-  addLog(state, `Auction started for position ${position}.`);
-}
-
-export function placeBid(
-  state: GameState,
-  playerId: string,
-  amount: number,
-): string | null {
-  if (!state.auction) return "No active auction.";
-  const { auction } = state;
-
-  if (!auction.activeBidders.includes(playerId))
-    return "You are not in this auction.";
-  if (amount <= auction.highestBid)
-    return `Bid must be higher than current highest ($${auction.highestBid}).`;
-
-  const player = getPlayerById(state, playerId)!;
-  if (player.money < amount) return "Not enough money.";
-
-  auction.highestBid = amount;
-  auction.highestBidderId = playerId;
-  addLog(state, `${player.name} bid $${amount} in the auction.`);
-  return null;
-}
-
-export function withdrawFromAuction(state: GameState, playerId: string): void {
-  if (!state.auction) return;
-  state.auction.activeBidders = state.auction.activeBidders.filter(
-    (id) => id !== playerId,
-  );
-  addLog(state, `Player ${playerId} withdrew from auction.`);
-}
-
-export function endAuction(state: GameState): {
-  winnerId: string | null;
-  amount: number;
-} {
-  if (!state.auction) return { winnerId: null, amount: 0 };
-
-  const { auction } = state;
-  const result = {
-    winnerId: auction.highestBidderId,
-    amount: auction.highestBid,
-  };
-
-  if (auction.highestBidderId && auction.highestBid > 0) {
-    const winner = getPlayerById(state, auction.highestBidderId)!;
-    const space = getSpace(state, auction.propertyPosition);
-    winner.money -= auction.highestBid;
-    space.ownerId = winner.id;
-    winner.properties.push(auction.propertyPosition);
-    addLog(
-      state,
-      `${winner.name} won the auction for position ${auction.propertyPosition} at $${auction.highestBid}.`,
-    );
-  } else {
-    addLog(state, `Auction ended with no winner.`);
-  }
-
-  state.auction = null;
-  return result;
-}
-
 // ─── Trade ───────────────────────────────────────────────────────────────────
 
 export function proposeTrade(state: GameState, trade: Trade): string | null {
@@ -688,7 +617,7 @@ export function declareBankruptcy(
     }
     creditor.getOutOfJailCards += player.getOutOfJailCards;
   } else {
-    // Bankrupt to bank — properties go to auction (handled by socket layer)
+    // Bankrupt to bank — cash gone, properties return to unowned
     for (const pos of player.properties) {
       const sp = getSpace(state, pos);
       sp.ownerId = null;
@@ -728,5 +657,73 @@ export function advanceTurn(state: GameState): void {
     next = (next + 1) % state.players.length;
   }
   state.currentPlayerIndex = next;
+  state.turnEndsAt = Date.now() + 20 * 1000; // reset 20s turn timer
   addLog(state, `It is now ${state.players[next].name}'s turn.`);
+}
+
+// ─── Net Worth & Game End ─────────────────────────────────────────────────────
+
+export function calculateNetWorth(state: GameState, playerId: string): number {
+  const player = state.players.find((p) => p.id === playerId);
+  if (!player || player.isBankrupt) return 0;
+
+  let worth = player.money;
+
+  for (const pos of player.properties) {
+    const space = state.board[pos];
+    if (!space) continue;
+    if (space.isMortgaged) {
+      // Mortgaged properties count at half mortgage value
+      worth += Math.floor((space.mortgageValue ?? 0) / 2);
+    } else {
+      worth += space.mortgageValue ?? 0; // base property value
+      worth += space.houses * (space.houseCost ?? 0);
+      if (space.hasHotel) worth += space.houseCost ?? 0; // hotel = 5th house cost
+    }
+  }
+
+  return worth;
+}
+
+export function resolveGameEnd(
+  state: GameState,
+): { first: string; second: string | null } | null {
+  const active = activePlayers(state);
+  if (active.length === 0) return null;
+
+  const ranked = [...active].sort(
+    (a, b) =>
+      calculateNetWorth(state, b.id) - calculateNetWorth(state, a.id) ||
+      b.money - a.money, // tie-break by cash
+  );
+
+  const first = ranked[0];
+  const second = ranked[1] ?? null;
+
+  state.status = "ended";
+  state.winner = first.id;
+  state.winners = [
+    {
+      playerId: first.id,
+      place: 1,
+      netWorth: calculateNetWorth(state, first.id),
+      payoutShare: 0.65,
+    },
+    ...(second
+      ? [
+          {
+            playerId: second.id,
+            place: 2 as const,
+            netWorth: calculateNetWorth(state, second.id),
+            payoutShare: 0.27,
+          },
+        ]
+      : []),
+  ];
+
+  addLog(
+    state,
+    `Game over! ${first.name} wins with net worth $${calculateNetWorth(state, first.id)}.`,
+  );
+  return { first: first.id, second: second?.id ?? null };
 }

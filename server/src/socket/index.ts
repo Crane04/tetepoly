@@ -35,18 +35,194 @@ import {
   applyCard,
   sendToJail,
   exitJail,
-  startAuction,
-  placeBid,
-  withdrawFromAuction,
-  endAuction,
   proposeTrade,
   executeTrade,
   declareBankruptcy,
   advanceTurn,
+  resolveGameEnd,
+  calculateNetWorth,
 } from "../game/GameState";
 import { rollDice, isDoubles } from "../game/Dice";
 
 const COUNTDOWN_SECONDS = 30;
+const TURN_SECONDS = 20;
+const GAME_MINUTES = 15;
+
+// ─── Turn & Game Timers ───────────────────────────────────────────────────────
+
+// gameId → turn timer
+const turnTimers = new Map<string, NodeJS.Timeout>();
+// gameId → game timer
+const gameTimers = new Map<string, NodeJS.Timeout>();
+
+function clearTurnTimer(gameId: string): void {
+  const t = turnTimers.get(gameId);
+  if (t) {
+    clearTimeout(t);
+    turnTimers.delete(gameId);
+  }
+}
+
+function clearGameTimer(gameId: string): void {
+  const t = gameTimers.get(gameId);
+  if (t) {
+    clearTimeout(t);
+    gameTimers.delete(gameId);
+  }
+}
+
+// Called after gameState is emitted — fires auto-action if player doesn't act in time
+function startTurnTimer(io: Server, gameId: string, playerId: string): void {
+  clearTurnTimer(gameId);
+  const timer = setTimeout(() => {
+    turnTimers.delete(gameId);
+    const game = getGame(gameId);
+    if (!game || game.status !== "started") return;
+    if (currentPlayer(game).id !== playerId) return; // turn already advanced
+
+    const player = currentPlayer(game);
+
+    // Auto-action: if no dice rolled yet, auto-roll
+    if (!game.diceRoll) {
+      const dice = rollDice();
+      const total = dice[0] + dice[1];
+      const doubles = isDoubles(dice);
+      game.diceRoll = dice;
+      game.lastDiceRollWasDoubles = doubles;
+
+      if (player.inJail) {
+        if (doubles) {
+          exitJail(game, playerId, "roll");
+          movePlayer(game, playerId, total);
+          const deferred = resolveSpace(io, {} as any, game, playerId, total);
+          game.turnEndsAt = Date.now() + TURN_SECONDS * 1000;
+          setGame(gameId, game);
+          emit(io, gameId, game);
+          emitDeferred(io, gameId, playerId, deferred);
+          // If property landed, auto-decline after a beat
+          if (deferred.propertyLanded) {
+            setTimeout(() => autoDeclineAndAdvance(io, gameId, playerId), 3000);
+          } else {
+            setTimeout(() => autoEndTurn(io, gameId, playerId), 3000);
+          }
+        } else {
+          player.jailTurnsRemaining -= 1;
+          if (player.jailTurnsRemaining <= 0) {
+            if (player.money >= 50) {
+              player.money -= 50;
+              exitJail(game, playerId, "fine");
+            }
+            movePlayer(game, playerId, total);
+            const deferred = resolveSpace(io, {} as any, game, playerId, total);
+            game.turnEndsAt = Date.now() + TURN_SECONDS * 1000;
+            setGame(gameId, game);
+            emit(io, gameId, game);
+            emitDeferred(io, gameId, playerId, deferred);
+            if (deferred.propertyLanded) {
+              setTimeout(
+                () => autoDeclineAndAdvance(io, gameId, playerId),
+                3000,
+              );
+            } else {
+              setTimeout(() => autoEndTurn(io, gameId, playerId), 3000);
+            }
+          } else {
+            game.turnEndsAt = Date.now() + TURN_SECONDS * 1000;
+            setGame(gameId, game);
+            emit(io, gameId, game);
+            setTimeout(() => autoEndTurn(io, gameId, playerId), 3000);
+          }
+        }
+        return;
+      }
+
+      // Normal auto-roll
+      if (doubles) {
+        game.doublesCount += 1;
+        if (game.doublesCount >= 3) {
+          sendToJail(game, playerId);
+          game.turnEndsAt = Date.now() + TURN_SECONDS * 1000;
+          setGame(gameId, game);
+          emit(io, gameId, game);
+          setTimeout(() => autoEndTurn(io, gameId, playerId), 3000);
+          return;
+        }
+      } else {
+        game.doublesCount = 0;
+      }
+
+      movePlayer(game, playerId, total);
+      const deferred = resolveSpace(io, {} as any, game, playerId, total);
+      game.turnEndsAt = Date.now() + TURN_SECONDS * 1000;
+      setGame(gameId, game);
+      emit(io, gameId, game);
+      emitDeferred(io, gameId, playerId, deferred);
+      if (deferred.propertyLanded) {
+        setTimeout(() => autoDeclineAndAdvance(io, gameId, playerId), 3000);
+      } else if (!doubles) {
+        setTimeout(() => autoEndTurn(io, gameId, playerId), 3000);
+      } else {
+        // Doubles — start a new turn timer for the re-roll
+        startTurnTimer(io, gameId, playerId);
+      }
+      return;
+    }
+
+    // Dice already rolled — auto end turn
+    autoEndTurn(io, gameId, playerId);
+  }, TURN_SECONDS * 1000);
+
+  turnTimers.set(gameId, timer);
+}
+
+function autoEndTurn(io: Server, gameId: string, playerId: string): void {
+  const game = getGame(gameId);
+  if (!game || game.status !== "started") return;
+  if (currentPlayer(game).id !== playerId) return;
+  advanceTurn(game);
+  setGame(gameId, game);
+  emit(io, gameId, game);
+  startTurnTimer(io, gameId, currentPlayer(game).id);
+}
+
+function autoDeclineAndAdvance(
+  io: Server,
+  gameId: string,
+  playerId: string,
+): void {
+  const game = getGame(gameId);
+  if (!game || game.status !== "started") return;
+  if (currentPlayer(game).id !== playerId) return;
+  // Property stays unowned — just advance turn
+  autoEndTurn(io, gameId, playerId);
+}
+
+function startGameTimer(io: Server, gameId: string): void {
+  clearGameTimer(gameId);
+  const timer = setTimeout(
+    () => {
+      gameTimers.delete(gameId);
+      clearTurnTimer(gameId);
+      const game = getGame(gameId);
+      if (!game || game.status !== "started") return;
+
+      const result = resolveGameEnd(game);
+      if (!result) return;
+
+      setGame(gameId, game);
+      emit(io, gameId, game);
+      io.to(gameId).emit("gameOver", {
+        winnerId: result.first,
+        secondId: result.second,
+        winners: game.winners,
+      });
+      io.emit("roomsList", getRoomList());
+    },
+    GAME_MINUTES * 60 * 1000,
+  );
+
+  gameTimers.set(gameId, timer);
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -154,13 +330,17 @@ function autoStartGame(roomId: string, io: Server) {
   io.to(gameCode).emit("gameStarted", game);
   io.to(gameCode).emit("gameState", game);
   io.emit("roomsList", getRoomList());
+
+  // Start 15-min game timer and first player's 20s turn timer
+  startGameTimer(io, gameCode);
+  startTurnTimer(io, gameCode, game.players[0].id);
 }
 
 // After rolling, resolve the space the player is on.
 // Returns deferred events to emit AFTER gameState, so the client always
 // starts the token animation before any modal/UI reaction is triggered.
 interface DeferredEvents {
-  cardDrawn?: { deck: "chance" | "community_chest"; card: Card };
+  // cardDrawn removed — emitted immediately in resolveSpace before movement
   propertyLanded?: {
     playerId: string;
     position: number;
@@ -209,6 +389,15 @@ function resolveSpace(
     case "chance":
     case "community_chest": {
       const card = drawCard(game, space.type);
+
+      // Emit the card IMMEDIATELY — before applying movement.
+      // Client shows the card modal first, then the movement animation plays.
+      io.to(game.gameId).emit("cardDrawn", {
+        playerId,
+        deck: space.type,
+        card,
+      });
+
       const overrides = applyCard(game, playerId, card, diceTotal);
 
       if (
@@ -216,7 +405,8 @@ function resolveSpace(
         card.action === "advance_to_nearest"
       ) {
         if (card.action === "advance_to" && player.position !== position) {
-          resolveSpace(
+          // Brief delay before emitting the new gameState so card modal has time to show
+          return resolveSpace(
             io,
             socket,
             game,
@@ -226,7 +416,7 @@ function resolveSpace(
             overrides.utilityMultiplier,
           );
         } else if (card.action === "advance_to_nearest") {
-          resolveSpace(
+          return resolveSpace(
             io,
             socket,
             game,
@@ -237,7 +427,8 @@ function resolveSpace(
           );
         }
       }
-      return { cardDrawn: { deck: space.type, card } };
+      // Non-movement card — cardDrawn already emitted above, return empty deferred
+      return {};
     }
 
     case "property":
@@ -285,9 +476,7 @@ function emitDeferred(
   playerId: string,
   events: DeferredEvents,
 ): void {
-  if (events.cardDrawn) {
-    io.to(gameId).emit("cardDrawn", { playerId, ...events.cardDrawn });
-  }
+  // cardDrawn is emitted directly in resolveSpace (before movement), not here
   if (events.propertyLanded) {
     io.to(gameId).emit("propertyLanded", events.propertyLanded);
   }
@@ -431,6 +620,8 @@ export function registerSocketHandlers(io: Server): void {
       setGame(gameId, game);
       emit(io, gameId, game);
       emitDeferred(io, gameId, playerId, deferred);
+      // Restart turn timer — player now needs to end turn (or decide on property)
+      startTurnTimer(io, gameId, playerId);
     });
 
     // ── buyProperty ──────────────────────────────────────────────────────────
@@ -453,63 +644,22 @@ export function registerSocketHandlers(io: Server): void {
       },
     );
 
-    // ── declineBuy ───────────────────────────────────────────────────────────
+    // ── declineBuy ──────────────────────────────────────────────────────────
+    // No auction — declined property simply stays unowned
     socket.on(
       "declineBuy",
-      ({ gameId, position }: { gameId: string; position: number }) => {
+      ({ gameId }: { gameId: string; position: number }) => {
         const playerId = guardAuth(socket);
         if (!playerId) return;
         const game = guardGame(socket, gameId);
         if (!game) return;
         if (!guardStarted(socket, game)) return;
         if (!guardTurn(socket, game, playerId)) return;
-
-        startAuction(game, position);
-        io.to(gameId).emit("auctionStarted", { auction: game.auction });
+        // Property stays unowned — player can now end their turn
         setGame(gameId, game);
         emit(io, gameId, game);
       },
     );
-
-    // ── placeBid ─────────────────────────────────────────────────────────────
-    socket.on(
-      "placeBid",
-      ({ gameId, amount }: { gameId: string; amount: number }) => {
-        const playerId = guardAuth(socket);
-        if (!playerId) return;
-        const game = guardGame(socket, gameId);
-        if (!game) return;
-        if (!guardStarted(socket, game)) return;
-
-        const bidErr = placeBid(game, playerId, amount);
-        if (bidErr) return err(socket, bidErr);
-
-        io.to(gameId).emit("auctionBid", { auction: game.auction });
-        setGame(gameId, game);
-        emit(io, gameId, game);
-      },
-    );
-
-    // ── withdrawFromAuction ──────────────────────────────────────────────────
-    socket.on("withdrawFromAuction", ({ gameId }: { gameId: string }) => {
-      const playerId = guardAuth(socket);
-      if (!playerId) return;
-      const game = guardGame(socket, gameId);
-      if (!game) return;
-      if (!guardStarted(socket, game)) return;
-
-      withdrawFromAuction(game, playerId);
-
-      const remaining = game.auction?.activeBidders ?? [];
-      if (remaining.length <= 1) {
-        const result = endAuction(game);
-        io.to(gameId).emit("auctionEnded", result);
-      } else {
-        io.to(gameId).emit("auctionBid", { auction: game.auction });
-      }
-      setGame(gameId, game);
-      emit(io, gameId, game);
-    });
 
     // ── buildHouse ───────────────────────────────────────────────────────────
     socket.on(
@@ -727,10 +877,13 @@ export function registerSocketHandlers(io: Server): void {
       io.to(gameId).emit("playerBankrupt", { playerId, creditorId: null });
 
       if (game.status === "ended" && game.winner) {
+        clearTurnTimer(gameId);
+        clearGameTimer(gameId);
         const winner = getPlayerById(game, game.winner)!;
         io.to(gameId).emit("gameOver", {
           winnerId: game.winner,
           winnerName: winner.name,
+          winners: game.winners,
         });
         io.emit("roomsList", getRoomList());
       }
@@ -755,6 +908,7 @@ export function registerSocketHandlers(io: Server): void {
       advanceTurn(game);
       setGame(gameId, game);
       emit(io, gameId, game);
+      startTurnTimer(io, gameId, currentPlayer(game).id);
     });
 
     // ── leaveGame ────────────────────────────────────────────────────────────
@@ -779,6 +933,26 @@ export function registerSocketHandlers(io: Server): void {
       if (game && playerName) {
         const player = getPlayerById(game, playerName);
         if (player) player.isConnected = false;
+        // If only one active player remains, end game early
+        const stillActive = game.players.filter(
+          (p) => !p.isBankrupt && p.isConnected,
+        );
+        if (stillActive.length === 1 && game.status === "started") {
+          clearTurnTimer(gameId);
+          clearGameTimer(gameId);
+          const result = resolveGameEnd(game);
+          if (result) {
+            setGame(gameId, game);
+            emit(io, gameId, game);
+            io.to(gameId).emit("gameOver", {
+              winnerId: result.first,
+              secondId: result.second,
+              winners: game.winners,
+            });
+            io.emit("roomsList", getRoomList());
+            return;
+          }
+        }
         setGame(gameId, game);
         io.to(gameId).emit("playerLeft", { playerId: playerName });
         emit(io, gameId, game);

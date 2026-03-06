@@ -27,11 +27,14 @@ export default function Game() {
     pendingPropertyLanded,
     lastRentPaid,
     lastCardDrawn,
+    pendingCardDrawn,
     clearPendingProperty,
     clearRentPaid,
     clearCardDrawn,
     playerDisplayPositions,
     leaveRoom,
+    activeTurnTimerEndsAt,
+    animatingPlayerIds,
   } = useGameStore();
   const socket = getSocket();
 
@@ -69,6 +72,25 @@ export default function Game() {
     const t = setTimeout(clearRentPaid, 3000);
     return () => clearTimeout(t);
   }, [lastRentPaid, clearRentPaid]);
+
+  // Turn timer countdown — updates every second, only ticks when no animation playing
+  const [turnSecsLeft, setTurnSecsLeft] = useState<number | null>(null);
+  useEffect(() => {
+    if (!activeTurnTimerEndsAt) {
+      setTurnSecsLeft(null);
+      return;
+    }
+    const tick = () => {
+      const secs = Math.max(
+        0,
+        Math.round((activeTurnTimerEndsAt - Date.now()) / 1000),
+      );
+      setTurnSecsLeft(secs);
+    };
+    tick();
+    const t = setInterval(tick, 500);
+    return () => clearInterval(t);
+  }, [activeTurnTimerEndsAt]);
 
   function handleReconnect() {
     const name = reconnectName.trim();
@@ -188,11 +210,27 @@ export default function Game() {
 
         {/* Nav */}
         <nav className="hidden md:flex items-center gap-5 text-[10px] tracking-[0.2em] uppercase">
-          <span
-            className={`font-semibold ${isMyTurn ? "text-[#2a6050]" : "text-[#2a3848]"}`}
-          >
-            {isMyTurn ? "Your Turn" : `${current?.name}'s Turn`}
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className={`font-semibold ${isMyTurn ? "text-[#2a6050]" : "text-[#2a3848]"}`}
+            >
+              {isMyTurn ? "Your Turn" : `${current?.name}'s Turn`}
+            </span>
+            {turnSecsLeft !== null && (
+              <span
+                className="font-mono text-[10px] px-1.5 py-0.5 rounded border"
+                style={{
+                  borderColor: turnSecsLeft <= 5 ? "#5a1a1a" : "#1a2a1a",
+                  color: turnSecsLeft <= 5 ? "#c04040" : "#2a6050",
+                  backgroundColor: turnSecsLeft <= 5 ? "#1a0808" : "#0a1810",
+                  minWidth: "2.5rem",
+                  textAlign: "center",
+                }}
+              >
+                {String(turnSecsLeft).padStart(2, "0")}s
+              </span>
+            )}
+          </div>
           <button
             className="text-[#2a3848] hover:text-red-600 transition-colors"
             onClick={leaveRoom}
@@ -506,6 +544,24 @@ export default function Game() {
       </div>
 
       {/* ── Modals ────────────────────────────────────────────────── */}
+
+      {/* Pending card (shown BEFORE movement for advance_to cards) */}
+      {pendingCardDrawn &&
+        !lastCardDrawn &&
+        (() => {
+          const drawer = gameState.players.find(
+            (p) => p.id === pendingCardDrawn.playerId,
+          );
+          return (
+            <CardDrawnModal
+              deck={pendingCardDrawn.deck}
+              card={pendingCardDrawn.card}
+              playerName={drawer?.name ?? "Someone"}
+              onClose={clearCardDrawn}
+            />
+          );
+        })()}
+
       {viewingSpace && !pendingPropertyLanded && (
         <PropertyCard
           space={viewingSpace}
@@ -524,6 +580,7 @@ export default function Game() {
             clearPendingProperty();
           }}
           onDecline={() => {
+            // No auction — just decline, property stays unowned
             emit("declineBuy", { position: pendingPropertyLanded.position });
             clearPendingProperty();
           }}
@@ -578,15 +635,58 @@ export default function Game() {
       {/* Game over */}
       {gameState.status === "ended" && (
         <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
-          <div className="bg-[#0f1117] border border-[#1e2230] rounded-xl p-10 text-center flex flex-col gap-5 max-w-sm w-full mx-4">
-            <p className="text-[10px] text-[#2a3848] tracking-[0.25em] uppercase">
-              Game Over
-            </p>
-            <h2 className="text-2xl font-bold tracking-tight text-slate-100 uppercase">
-              {gameState.players.find((p) => p.id === gameState.winner)?.name ??
-                "Someone"}{" "}
-              Wins
-            </h2>
+          <div className="bg-[#0f1117] border border-[#1e2230] rounded-xl p-10 text-center flex flex-col gap-6 max-w-sm w-full mx-4">
+            <div>
+              <p className="text-[10px] text-[#2a3848] tracking-[0.25em] uppercase mb-3">
+                Game Over
+              </p>
+              <h2 className="text-2xl font-bold tracking-tight text-slate-100 uppercase">
+                {gameState.players.find((p) => p.id === gameState.winner)
+                  ?.name ?? "Someone"}{" "}
+                Wins
+              </h2>
+            </div>
+
+            {/* Payout breakdown */}
+            {gameState.winners && gameState.winners.length > 0 && (
+              <div className="flex flex-col gap-2 border border-[#1a1f2c] rounded-lg overflow-hidden">
+                {gameState.winners.map((w) => {
+                  const player = gameState.players.find(
+                    (p) => p.id === w.playerId,
+                  );
+                  return (
+                    <div
+                      key={w.playerId}
+                      className="flex items-center justify-between px-4 py-3 border-b border-[#1a1f2c] last:border-0"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-[#2a3848] font-mono w-5">
+                          {w.place === 1 ? "1ST" : "2ND"}
+                        </span>
+                        <span className="text-xs text-slate-300 font-semibold">
+                          {player?.name}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <p className="font-mono text-xs text-slate-300">
+                          {Math.round(w.payoutShare * 100)}%
+                        </p>
+                        <p className="font-mono text-[10px] text-[#2a3848]">
+                          NW: ${w.netWorth.toLocaleString()}
+                        </p>
+                      </div>
+                    </div>
+                  );
+                })}
+                <div className="flex items-center justify-between px-4 py-3 bg-[#0a0c12]">
+                  <span className="text-[10px] text-[#2a3848] tracking-[0.15em] uppercase">
+                    House
+                  </span>
+                  <span className="font-mono text-xs text-[#2a3848]">8%</span>
+                </div>
+              </div>
+            )}
+
             <button
               className="text-[10px] font-semibold tracking-[0.2em] uppercase px-6 py-2.5 rounded border border-[#1e2230] text-[#3a4a5a] hover:border-[#2a3848] hover:text-slate-400 transition-colors"
               onClick={leaveRoom}

@@ -1,33 +1,61 @@
-import { GameState } from '../types';
-import { initGameState } from './GameState';
+import { GameState } from "../types";
+import { initGameState } from "./GameState";
 
 // ─── Room Config ──────────────────────────────────────────────────────────────
 
 export interface RoomConfig {
   id: string;
   name: string;
-  startingMoney: number;
+  buyIn: number; // real money buy-in in NGN
+  startingMoney: number; // in-game starting cash (Monopoly money)
   capacity: number;
 }
 
 export const ROOM_CONFIGS: RoomConfig[] = [
-  { id: 'room-1', name: 'Starter Stakes', startingMoney: 1000, capacity: 4 },
-  { id: 'room-2', name: 'Classic',        startingMoney: 1500, capacity: 6 },
-  { id: 'room-3', name: 'High Roller',    startingMoney: 3000, capacity: 4 },
-  { id: 'room-4', name: 'Open Table',     startingMoney: 1500, capacity: 8 },
+  {
+    id: "room-1",
+    name: "Starter",
+    buyIn: 15000,
+    startingMoney: 1500,
+    capacity: 4,
+  },
+  {
+    id: "room-2",
+    name: "Standard",
+    buyIn: 50000,
+    startingMoney: 1500,
+    capacity: 4,
+  },
+  {
+    id: "room-3",
+    name: "High Roller",
+    buyIn: 100000,
+    startingMoney: 1500,
+    capacity: 4,
+  },
+  {
+    id: "room-4",
+    name: "Elite",
+    buyIn: 150000,
+    startingMoney: 1500,
+    capacity: 4,
+  },
 ];
 
-const TOKENS = ['🎩', '🚗', '🐶', '⛵', '👢', '🎭', '🛒', '🥾'];
+const TOKENS = ["🎩", "🚗", "🐶", "⛵", "👢", "🎭", "🛒", "🥾"];
 
 function generateGameCode(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  return Array.from(
+    { length: 6 },
+    () => chars[Math.floor(Math.random() * chars.length)],
+  ).join("");
 }
 
 // ─── Internal Types ───────────────────────────────────────────────────────────
 
 interface PendingPlayer {
-  name: string;     // used as player ID
+  name: string; // used as player ID
   token: string;
   socketId: string;
 }
@@ -109,27 +137,31 @@ export function getLocationForPlayer(playerName: string): string | undefined {
 export interface RoomInfo {
   id: string;
   name: string;
+  buyIn: number;
   startingMoney: number;
   capacity: number;
   playerCount: number;
   waitingCount: number;
-  status: 'waiting' | 'started' | 'ended';
+  status: "waiting" | "started" | "ended";
   countdownEndsAt: number | null;
 }
 
 export function getRoomList(): RoomInfo[] {
   return ROOM_CONFIGS.map((config) => {
     const room = rooms.get(config.id)!;
-    const activeGame = room.activeGameCode ? games.get(room.activeGameCode) : null;
+    const activeGame = room.activeGameCode
+      ? games.get(room.activeGameCode)
+      : null;
     const status = activeGame
-      ? (activeGame.status as 'waiting' | 'started' | 'ended')
-      : 'waiting';
+      ? (activeGame.status as "waiting" | "started" | "ended")
+      : "waiting";
     const playerCount = activeGame
       ? activeGame.players.filter((p) => !p.isBankrupt).length
       : 0;
     return {
       id: config.id,
       name: config.name,
+      buyIn: config.buyIn,
       startingMoney: config.startingMoney,
       capacity: config.capacity,
       playerCount,
@@ -165,7 +197,7 @@ export function addPlayerToRoom(
   player: { name: string; socketId: string },
 ): string | null {
   const room = rooms.get(roomId);
-  if (!room) return 'Room not found.';
+  if (!room) return "Room not found.";
 
   // If already in queue, just update socket ID (reconnect to waiting room)
   const existing = room.pendingPlayers.find((p) => p.name === player.name);
@@ -175,16 +207,25 @@ export function addPlayerToRoom(
     return null;
   }
 
-  if (room.pendingPlayers.length >= room.config.capacity) return 'Room is full.';
+  if (room.pendingPlayers.length >= room.config.capacity)
+    return "Room is full.";
 
   // Enforce unique names within the queue
-  if (room.pendingPlayers.find((p) => p.name.toLowerCase() === player.name.toLowerCase())) {
-    return 'Name already taken in this room.';
+  if (
+    room.pendingPlayers.find(
+      (p) => p.name.toLowerCase() === player.name.toLowerCase(),
+    )
+  ) {
+    return "Name already taken in this room.";
   }
 
   const usedTokens = new Set(room.pendingPlayers.map((p) => p.token));
   const token = pickToken(usedTokens);
-  room.pendingPlayers.push({ name: player.name, token, socketId: player.socketId });
+  room.pendingPlayers.push({
+    name: player.name,
+    token,
+    socketId: player.socketId,
+  });
   registerSocket(player.socketId, player.name);
   playerToLocation.set(player.name, roomId);
   return null;
@@ -193,20 +234,28 @@ export function addPlayerToRoom(
 export function removePlayerFromRoom(roomId: string, playerName: string): void {
   const room = rooms.get(roomId);
   if (!room) return;
-  room.pendingPlayers = room.pendingPlayers.filter((p) => p.name !== playerName);
+  room.pendingPlayers = room.pendingPlayers.filter(
+    (p) => p.name !== playerName,
+  );
   if (playerToLocation.get(playerName) === roomId) {
     playerToLocation.delete(playerName);
   }
 }
 
-export function startGame(roomId: string): { game: GameState; socketIds: string[] } | string {
+export function startGame(
+  roomId: string,
+): { game: GameState; socketIds: string[] } | string {
   const room = rooms.get(roomId);
-  if (!room) return 'Room not found.';
-  if (room.pendingPlayers.length < 2) return 'Need at least 2 players.';
+  if (!room) return "Room not found.";
+  if (room.pendingPlayers.length < 2) return "Need at least 2 players.";
 
   const gameCode = generateGameCode();
   const game = initGameState(
-    room.pendingPlayers.map((p) => ({ id: p.name, name: p.name, token: p.token })),
+    room.pendingPlayers.map((p) => ({
+      id: p.name,
+      name: p.name,
+      token: p.token,
+    })),
     room.config.startingMoney,
   );
   game.gameId = gameCode;

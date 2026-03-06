@@ -49,6 +49,13 @@ interface GameStore {
     deck: "chance" | "community_chest";
     card: Card;
   } | null;
+  // Card shown immediately on landing (before movement, for advance_to cards)
+  pendingCardDrawn: {
+    playerId: string;
+    deck: "chance" | "community_chest";
+    card: Card;
+    isMoving: boolean; // true if this card causes movement
+  } | null;
   queuedCardDrawn: {
     playerId: string;
     deck: "chance" | "community_chest";
@@ -56,6 +63,8 @@ interface GameStore {
   } | null;
   playerDisplayPositions: Record<string, number>;
   animatingPlayerIds: string[];
+  // Timer for current player's turn — null while animating, set once animation done
+  activeTurnTimerEndsAt: number | null;
 
   // Actions
   setGameState: (state: GameState) => void;
@@ -107,14 +116,20 @@ function animatePlayerMove(
             isLast && s.queuedCardDrawn?.playerId === playerId
               ? s.queuedCardDrawn
               : null;
+          const remainingAnimators = isLast
+            ? s.animatingPlayerIds.filter((id) => id !== playerId)
+            : s.animatingPlayerIds;
+          const noneAnimating = isLast && remainingAnimators.length === 0;
           return {
             playerDisplayPositions: {
               ...s.playerDisplayPositions,
               [playerId]: stepPos,
             },
-            animatingPlayerIds: isLast
-              ? s.animatingPlayerIds.filter((id) => id !== playerId)
-              : s.animatingPlayerIds,
+            animatingPlayerIds: remainingAnimators,
+            // Activate turn timer display once ALL animations are done
+            ...(noneAnimating && s.gameState?.turnEndsAt
+              ? { activeTurnTimerEndsAt: s.gameState.turnEndsAt }
+              : {}),
             ...(queued
               ? { pendingPropertyLanded: queued, queuedPropertyLanded: null }
               : {}),
@@ -159,8 +174,10 @@ export const useGameStore = create<GameStore>((set, get) => ({
   lastRentPaid: null,
   lastCardDrawn: null,
   queuedCardDrawn: null,
+  pendingCardDrawn: null,
   playerDisplayPositions: {},
   animatingPlayerIds: [],
+  activeTurnTimerEndsAt: null,
 
   setGameState: (gameState) => set({ gameState }),
 
@@ -181,7 +198,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   setMyPlayerId: (id) => set({ myPlayerId: id }),
   clearPendingProperty: () => set({ pendingPropertyLanded: null }),
   clearRentPaid: () => set({ lastRentPaid: null }),
-  clearCardDrawn: () => set({ lastCardDrawn: null }),
+  clearCardDrawn: () => set({ lastCardDrawn: null, pendingCardDrawn: null }),
 
   leaveRoom: () => {
     const { currentGameId } = get();
@@ -215,7 +232,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
     // Full state sync (in-game or reconnect)
     socket.on("gameState", (state: GameState) => {
-      const { playerDisplayPositions, animatingPlayerIds, queuedCardDrawn } =
+      const { playerDisplayPositions, animatingPlayerIds, queuedCardDrawn, pendingCardDrawn } =
         get();
       const toAnimate: Array<{ id: string; from: number; to: number }> = [];
       const newDisplayPositions: Record<string, number> = {};
@@ -243,10 +260,18 @@ export const useGameStore = create<GameStore>((set, get) => ({
         gameState: state,
         playerDisplayPositions: newDisplayPositions,
         currentGameId: state.gameId,
+        // Only activate turn timer display when no animation is in progress
+        activeTurnTimerEndsAt:
+          toAnimate.length === 0 && animatingPlayerIds.length === 0
+            ? (state.turnEndsAt ?? null)
+            : null,
       });
 
+      // Delay movement animation if a moving card is currently being shown,
+      // so the player has time to read the card before the token jumps.
+      const moveDelay = pendingCardDrawn?.isMoving ? 1500 : 0;
       for (const { id, from, to } of toAnimate) {
-        animatePlayerMove(id, from, to, set);
+        setTimeout(() => animatePlayerMove(id, from, to, set), moveDelay);
       }
 
       // Only flush the queued card once the player's token is fully at rest.
@@ -327,9 +352,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
       set({ pendingPropertyLanded: null });
     });
 
-    socket.on("auctionStarted", () => {
-      set({ pendingPropertyLanded: null });
-    });
+    // auctionStarted removed — no auction system
 
     socket.on(
       "rentPaid",
@@ -350,9 +373,23 @@ export const useGameStore = create<GameStore>((set, get) => ({
         deck: "chance" | "community_chest";
         card: Card;
       }) => {
-        // Always queue — the gameState event (which triggers animation) hasn't arrived yet,
-        // so animatingPlayerIds would be empty even if movement is about to start.
-        set({ queuedCardDrawn: data });
+        const isMoving =
+          data.card.action === "advance_to" ||
+          data.card.action === "advance_to_nearest" ||
+          data.card.action === "go_to_jail" ||
+          data.card.action === "go_back";
+
+        if (isMoving) {
+          // Show card immediately so player sees WHY they are moving
+          // Also queue it so it persists through/after animation
+          set({
+            pendingCardDrawn: { ...data, isMoving: true },
+            queuedCardDrawn: data,
+          });
+        } else {
+          // Non-moving card: queue as before (flush after animation if any)
+          set({ queuedCardDrawn: data });
+        }
       },
     );
 

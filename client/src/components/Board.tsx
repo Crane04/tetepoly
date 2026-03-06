@@ -11,6 +11,8 @@ const PROP_COLOR: Record<string, string> = {
   Yellow: "#3a3200",
   Green: "#084a08",
   "Dark Blue": "#08083a",
+  Railroad: "#1a2030",
+  Utility: "#1a2a1a",
 };
 
 export const PLAYER_COLORS = [
